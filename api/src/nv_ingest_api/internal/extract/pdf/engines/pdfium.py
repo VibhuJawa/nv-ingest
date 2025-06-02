@@ -106,10 +106,13 @@ def _extract_page_elements_using_image_ensemble(
         # Perform inference using the NimClient.
         inference_results = yolox_client.infer(
             data,
-            model_name="yolox",
+            model_name=yolox_model_name,
             max_batch_size=YOLOX_MAX_BATCH_SIZE,
             trace_info=execution_trace_log,
             stage_name="pdf_extraction",
+            input_names=["INPUT_IMAGES", "THRESHOLDS"],
+            dtypes=["BYTES", "FP32"],
+            output_names=["OUTPUT"],
         )
 
         # Process results: iterate over each image's inference output.
@@ -271,6 +274,7 @@ def _extract_page_elements(
     yolox_endpoints: Tuple[Optional[str], Optional[str]],
     yolox_infer_protocol: str = "http",
     auth_token: Optional[str] = None,
+    yolox_model_name: str = "yolox",
     execution_trace_log=None,
 ) -> list:
     """
@@ -304,6 +308,8 @@ def _extract_page_elements(
         Protocol to use for inference (either "http" or "grpc").
     auth_token : Optional[str], default=None
         Authentication token for the inference service.
+    yolox_model_name : str, default="yolox"
+        The name of the YOLOX model to use for inference.
     execution_trace_log : optional
         List for accumulating execution trace information.
 
@@ -316,17 +322,6 @@ def _extract_page_elements(
     yolox_client = None
 
     try:
-        # Default model name
-        yolox_model_name = "yolox"
-
-        # Get the HTTP endpoint to determine the model name if needed
-        yolox_http_endpoint = yolox_endpoints[1]
-        if yolox_http_endpoint:
-            try:
-                yolox_model_name = get_yolox_model_name(yolox_http_endpoint)
-            except Exception as e:
-                logger.warning(f"Failed to get YOLOX model name from endpoint: {e}. Using default.")
-
         # Create the model interface
         model_interface = YoloxPageElementsModelInterface(yolox_model_name=yolox_model_name)
 
@@ -602,6 +597,17 @@ def pdfium_extractor(
             execution_trace_log=execution_trace_log,
         )
 
+    # Default model name for table/chart/infographics extraction
+    yolox_model_name = "yolox"
+    if extract_tables or extract_charts or extract_infographics:
+        # Get the gRPC endpoint to determine the model name if needed
+        yolox_grpc_endpoint = pdfium_config.yolox_endpoints[0]
+        if yolox_grpc_endpoint:
+            try:
+                yolox_model_name = get_yolox_model_name(yolox_grpc_endpoint, default_model_name=yolox_model_name)
+            except Exception as e:
+                logger.warning(f"Failed to get YOLOX model name from endpoint: {e}. Using default.")
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=pdfium_config.workers_per_progress_engine) as executor:
         # PAGE LOOP
         for page_idx in range(page_count):
@@ -645,8 +651,19 @@ def pdfium_extractor(
 
             # If we want tables or charts, use pre-rendered image
             if extract_tables or extract_charts or extract_infographics:
-                image, padding_offsets = rendered_imgs[page_idx]
-                pages_for_tables.append((page_idx, image, padding_offsets))
+                if yolox_model_name == "yolox":
+                    scale_tuple = (YOLOX_PAGE_IMAGE_PREPROC_WIDTH, YOLOX_PAGE_IMAGE_PREPROC_HEIGHT)
+                    padding_tuple = (YOLOX_PAGE_IMAGE_PREPROC_WIDTH, YOLOX_PAGE_IMAGE_PREPROC_HEIGHT)
+                else:
+                    scale_tuple = padding_tuple = None
+
+                image, padding_offsets = pdfium_pages_to_numpy(
+                    [page],
+                    scale_tuple=scale_tuple,
+                    padding_tuple=padding_tuple,
+                    trace_info=execution_trace_log,
+                )
+                pages_for_tables.append((page_idx, image[0], padding_offsets[0]))
 
                 # Whenever pages_for_tables hits YOLOX_MAX_BATCH_SIZE, submit a job
                 if len(pages_for_tables) >= YOLOX_MAX_BATCH_SIZE:
@@ -663,6 +680,7 @@ def pdfium_extractor(
                         pdfium_config.yolox_endpoints,
                         pdfium_config.yolox_infer_protocol,
                         pdfium_config.auth_token,
+                        yolox_model_name,
                         execution_trace_log=execution_trace_log,
                     )
                     futures.append(future)
@@ -685,6 +703,7 @@ def pdfium_extractor(
                 pdfium_config.yolox_endpoints,
                 pdfium_config.yolox_infer_protocol,
                 pdfium_config.auth_token,
+                yolox_model_name,
                 execution_trace_log=execution_trace_log,
             )
             futures.append(future)
