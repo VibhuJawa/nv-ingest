@@ -382,7 +382,8 @@ def _extract_page_elements(
 def _render_page_from_file(
     pdf_path: str,
     page_idx: int,
-    size: Tuple[int, int],
+    scale_tuple: Tuple[int, int],
+    padding_tuple: Tuple[int, int],
     execution_trace_log: Optional[List] = None,
 ) -> Tuple[int, np.ndarray, Tuple[int, int]]:
     """
@@ -394,8 +395,8 @@ def _render_page_from_file(
 
     arrays, pads = pdfium_pages_to_numpy(
         [page],
-        scale_tuple=size,
-        padding_tuple=size,
+        scale_tuple=scale_tuple,
+        padding_tuple=padding_tuple,
         trace_info=execution_trace_log,
     )
 
@@ -408,7 +409,8 @@ def _render_page_from_file(
 # ------------------------------------------------------------------ #
 def render_single_pdf_parallel(
     pdf_path: str,
-    size: Tuple[int, int],
+    scale_tuple: Tuple[int, int],
+    padding_tuple: Tuple[int, int],
     max_workers: int = 8,
     execution_trace_log: Optional[List] = None,
 ) -> List[Tuple[np.ndarray, Tuple[int, int]]]:
@@ -429,7 +431,7 @@ def render_single_pdf_parallel(
 
     with ProcessPoolExecutor(max_workers=max_workers) as pool:
         futs = [
-            pool.submit(_render_page_from_file, pdf_path, idx, size)
+            pool.submit(_render_page_from_file, pdf_path, idx, scale_tuple, padding_tuple)
             for idx in range(page_count)
         ]
         for fut in as_completed(futs):
@@ -587,15 +589,6 @@ def pdfium_extractor(
     pages_for_tables = []  # Accumulate tuples of (page_idx, np_image)
     futures = []  # To track asynchronous table/chart extraction tasks
 
-    # Pre-render all pages in parallel if needed for table/chart/infographic extraction
-    rendered_imgs: Optional[List[Tuple[np.ndarray, Tuple[int, int]]]] = None
-    if extract_tables or extract_charts or extract_infographics:
-        rendered_imgs = render_single_pdf_parallel(
-            pdf_path=pdf_path,
-            size=(YOLOX_PAGE_IMAGE_PREPROC_WIDTH, YOLOX_PAGE_IMAGE_PREPROC_HEIGHT),
-            max_workers=pdfium_config.workers_per_progress_engine,
-            execution_trace_log=execution_trace_log,
-        )
 
     # Default model name for table/chart/infographics extraction
     yolox_model_name = "yolox"
@@ -607,6 +600,24 @@ def pdfium_extractor(
                 yolox_model_name = get_yolox_model_name(yolox_grpc_endpoint, default_model_name=yolox_model_name)
             except Exception as e:
                 logger.warning(f"Failed to get YOLOX model name from endpoint: {e}. Using default.")
+
+    # Pre-render all pages in parallel if needed for table/chart/infographic extraction
+    rendered_imgs: Optional[List[Tuple[np.ndarray, Tuple[int, int]]]] = None
+    if extract_tables or extract_charts or extract_infographics:
+        if yolox_model_name == "yolox":
+            scale_tuple = (YOLOX_PAGE_IMAGE_PREPROC_WIDTH, YOLOX_PAGE_IMAGE_PREPROC_HEIGHT)
+            padding_tuple = (YOLOX_PAGE_IMAGE_PREPROC_WIDTH, YOLOX_PAGE_IMAGE_PREPROC_HEIGHT)
+        else:
+            scale_tuple = padding_tuple = None
+
+
+        rendered_imgs = render_single_pdf_parallel(
+            pdf_path=pdf_path,
+            scale_tuple=scale_tuple,
+            padding_tuple=padding_tuple,
+            max_workers=pdfium_config.workers_per_progress_engine,
+            execution_trace_log=execution_trace_log,
+        )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=pdfium_config.workers_per_progress_engine) as executor:
         # PAGE LOOP
@@ -651,19 +662,10 @@ def pdfium_extractor(
 
             # If we want tables or charts, use pre-rendered image
             if extract_tables or extract_charts or extract_infographics:
-                if yolox_model_name == "yolox":
-                    scale_tuple = (YOLOX_PAGE_IMAGE_PREPROC_WIDTH, YOLOX_PAGE_IMAGE_PREPROC_HEIGHT)
-                    padding_tuple = (YOLOX_PAGE_IMAGE_PREPROC_WIDTH, YOLOX_PAGE_IMAGE_PREPROC_HEIGHT)
-                else:
-                    scale_tuple = padding_tuple = None
 
-                image, padding_offsets = pdfium_pages_to_numpy(
-                    [page],
-                    scale_tuple=scale_tuple,
-                    padding_tuple=padding_tuple,
-                    trace_info=execution_trace_log,
-                )
-                pages_for_tables.append((page_idx, image[0], padding_offsets[0]))
+
+                image, padding_offsets = rendered_imgs[page_idx]
+                pages_for_tables.append((page_idx, image, padding_offsets))
 
                 # Whenever pages_for_tables hits YOLOX_MAX_BATCH_SIZE, submit a job
                 if len(pages_for_tables) >= YOLOX_MAX_BATCH_SIZE:
